@@ -1,56 +1,73 @@
 import argparse
 
-import pandas as pd
 import torch
 
-from sage_model import MatchSAGE, build_graph
+from sage_model import MatchSAGE, build_node_features, undirected
+from speed_dating import load_pairs, load_people
 
 
-def load(model_path="match_sage.pt", people_path="people.json", matches_path="matches.csv"):
-    people = pd.read_json(people_path)
-    matches = pd.read_csv(matches_path)
-    data = build_graph(people, matches)
-    model = MatchSAGE(data.num_node_features)
-    model.load_state_dict(torch.load(model_path))
+def load(model_path="match_sage.pt"):
+    """Load the trained model plus the full graph: every person and every known match."""
+    people, pairs = load_people(), load_pairs()
+    node_of = {pid: i for i, pid in enumerate(people["id"])}
+    matched = pairs[pairs["match"] == 1]
+    edge_pairs = torch.tensor([matched["person_a"].map(node_of).to_list(),
+                               matched["person_b"].map(node_of).to_list()])
+
+    checkpoint = torch.load(model_path)
+    x = build_node_features(people)
+    model = MatchSAGE(x.size(1))
+    model.load_state_dict(checkpoint["state_dict"])
     model.eval()
-    return model, data, people, matches
+    return {
+        "model": model,
+        "threshold": checkpoint["threshold"],
+        "people": people,
+        "pairs": pairs,
+        "x": x,
+        "edge_index": undirected(edge_pairs),
+        "node_of": node_of,
+    }
 
 
 @torch.no_grad()
-def predict_pair(model, data, person_a, person_b):
-    """Probability that two people (1-based ids) match."""
-    pair = torch.tensor([[person_a - 1], [person_b - 1]])
-    return torch.sigmoid(model(data.x, data.edge_index, pair)).item()
+def predict_pair(ctx, id_a, id_b):
+    """Probability that two participants (by id) match."""
+    pair = torch.tensor([[ctx["node_of"][id_a]], [ctx["node_of"][id_b]]])
+    return torch.sigmoid(ctx["model"](ctx["x"], ctx["edge_index"], pair)).item()
 
 
 @torch.no_grad()
-def recommend(model, data, matches, person, top_k=10):
-    """Rank everyone this person hasn't matched with yet by match probability."""
-    already = set(matches.loc[matches["source"] == person, "target"]) | set(
-        matches.loc[matches["target"] == person, "source"]
-    )
-    candidates = [p for p in range(1, data.num_nodes + 1) if p != person and p not in already]
+def recommend(ctx, person_id, top_k=10):
+    """Rank opposite-gender people this participant never dated by match probability."""
+    people, pairs = ctx["people"], ctx["pairs"]
+    gender = people.loc[people["id"] == person_id, "gender"].item()
+    dated = (set(pairs.loc[pairs["person_a"] == person_id, "person_b"])
+             | set(pairs.loc[pairs["person_b"] == person_id, "person_a"]))
+    candidates = people[(people["gender"] != gender) & ~people["id"].isin(dated)]
 
-    pairs = torch.tensor([[person - 1] * len(candidates), [c - 1 for c in candidates]])
-    probs = torch.sigmoid(model(data.x, data.edge_index, pairs))
-    ranked = pd.DataFrame({"id": candidates, "p_match": probs.numpy()})
-    return ranked.sort_values("p_match", ascending=False).head(top_k).reset_index(drop=True)
+    node = ctx["node_of"][person_id]
+    idx = [ctx["node_of"][c] for c in candidates["id"]]
+    pair_index = torch.tensor([[node] * len(idx), idx])
+    probs = torch.sigmoid(ctx["model"](ctx["x"], ctx["edge_index"], pair_index)).numpy()
+    ranked = candidates.assign(p_match=probs).sort_values("p_match", ascending=False)
+    return ranked.head(top_k).reset_index(drop=True)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Predict matches with the trained GraphSAGE model.")
-    parser.add_argument("person", type=int, help="id of the person (1-200)")
-    parser.add_argument("other", type=int, nargs="?", help="second person's id; omit to get recommendations")
+    parser.add_argument("person", type=int, help="participant id (1-552)")
+    parser.add_argument("other", type=int, nargs="?", help="second participant's id; omit to get recommendations")
     parser.add_argument("--top", type=int, default=10, help="number of recommendations")
     args = parser.parse_args()
 
-    model, data, people, matches = load()
-
+    ctx = load()
     if args.other is not None:
-        p = predict_pair(model, data, args.person, args.other)
-        print(f"person {args.person} & person {args.other}: p(match) = {p:.3f}")
+        p = predict_pair(ctx, args.person, args.other)
+        verdict = "match" if p >= ctx["threshold"] else "no match"
+        print(f"person {args.person} & person {args.other}: p(match) = {p:.3f} -> {verdict} "
+              f"(threshold {ctx['threshold']:.3f})")
     else:
-        recs = recommend(model, data, matches, args.person, args.top)
-        cols = ["id", "gender", "age", "relationship_goal", "likes"]
+        recs = recommend(ctx, args.person, args.top)
         print(f"top {args.top} new matches for person {args.person}:")
-        print(recs.merge(people[cols], on="id").to_string(index=False))
+        print(recs[["id", "p_match", "gender", "age", "goal", "field", "race"]].to_string(index=False))

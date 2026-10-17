@@ -4,15 +4,14 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
-from sklearn.metrics import accuracy_score, average_precision_score, roc_auc_score
+from sklearn.metrics import average_precision_score, f1_score, precision_recall_curve, precision_score, recall_score, roc_auc_score
 from torch import nn
-from torch_geometric.data import Data
 from torch_geometric.nn import SAGEConv
-from torch_geometric.transforms import RandomLinkSplit
-from torch_geometric.utils import negative_sampling
 
-from generate_dataset import EDUCATION_LEVELS, GENDERS, INTERESTS, RELATIONSHIP_GOALS, generate_people
-from generate_matches import generate_matches
+from speed_dating import (
+    FIELDS, GENDERS, GOALS, HOBBIES, OTHER_NUMERIC, PREFERENCES, RACES, SELF_RATINGS,
+    load_pairs, load_people,
+)
 
 SEED = 42
 HIDDEN_DIM = 64
@@ -21,48 +20,88 @@ LR = 0.005
 # Share of people whose matches are hidden from message passing each epoch,
 # so the model also learns to score brand-new users who have no matches yet
 COLD_START_RATIO = 0.2
+# Share of training dates used as supervision each epoch; their match edges are
+# removed from message passing, otherwise the model learns "edge exists" instead of compatibility
+SUPERVISION_RATIO = 0.3
+SPLIT_SHARES = {"train": 0.7, "val": 0.15, "test": 0.15}
+
+NUMERIC = OTHER_NUMERIC + HOBBIES + PREFERENCES + SELF_RATINGS
+CATEGORICAL = {
+    "gender": list(GENDERS.values()),
+    "goal": list(GOALS.values()),
+    "field": list(FIELDS.values()),
+    "race": list(RACES.values()),
+}
 
 
 def build_node_features(people, reference=None):
     """Encode each person as a fixed-length numeric vector.
 
-    Age and height are standardised with the stats of `reference` (defaults to
-    `people`), so new users are scaled exactly like the training data.
+    Numeric answers are imputed and standardised with the stats of `reference`
+    (defaults to `people`), so new users are scaled exactly like the training data.
+    A missing category becomes an all-zero one-hot block.
     """
     ref = people if reference is None else reference
-    age = (people["age"] - ref["age"].mean()) / ref["age"].std()
-    height = (people["height_cm"] - ref["height_cm"].mean()) / ref["height_cm"].std()
-
-    gender = pd.get_dummies(pd.Categorical(people["gender"], categories=GENDERS))
-    goal = pd.get_dummies(pd.Categorical(people["relationship_goal"], categories=RELATIONSHIP_GOALS))
-    education = pd.get_dummies(pd.Categorical(people["education"], categories=EDUCATION_LEVELS))
-
-    interest_idx = {name: i for i, name in enumerate(INTERESTS)}
-    likes = np.zeros((len(people), len(INTERESTS)))
-    dislikes = np.zeros((len(people), len(INTERESTS)))
-    for row, (liked, disliked) in enumerate(zip(people["likes"], people["dislikes"])):
-        likes[row, [interest_idx[x] for x in liked]] = 1
-        dislikes[row, [interest_idx[x] for x in disliked]] = 1
-
-    features = np.hstack([
-        age.to_numpy()[:, None],
-        height.to_numpy()[:, None],
-        gender.to_numpy(dtype=float),
-        goal.to_numpy(dtype=float),
-        education.to_numpy(dtype=float),
-        likes,
-        dislikes,
-    ])
-    return torch.tensor(features, dtype=torch.float)
+    numeric = people[NUMERIC].astype(float).fillna(ref[NUMERIC].median())
+    numeric = (numeric - ref[NUMERIC].mean()) / ref[NUMERIC].std()
+    one_hots = [
+        pd.get_dummies(pd.Categorical(people[col], categories=cats)).to_numpy(dtype=float)
+        for col, cats in CATEGORICAL.items()
+    ]
+    return torch.tensor(np.hstack([numeric.to_numpy()] + one_hots), dtype=torch.float)
 
 
-def build_graph(people, matches):
+def undirected(edge_pairs):
+    """[2, E] pairs -> [2, 2E] edge_index with both directions."""
+    return torch.cat([edge_pairs, edge_pairs.flip(0)], dim=1)
+
+
+def split_people(n, seed=SEED):
+    """Assign every person to train / val / test. Val and test people are unseen during training."""
+    order = np.random.default_rng(seed).permutation(n)
+    n_train = int(SPLIT_SHARES["train"] * n)
+    n_val = int(SPLIT_SHARES["val"] * n)
+    split = np.empty(n, dtype=object)
+    split[order[:n_train]] = "train"
+    split[order[n_train:n_train + n_val]] = "val"
+    split[order[n_train + n_val:]] = "test"
+    return split
+
+
+def build_dataset(seed=SEED):
+    people, pairs = load_people(), load_pairs()
+    node_of = {pid: i for i, pid in enumerate(people["id"])}
+    pairs["a_idx"] = pairs["person_a"].map(node_of)
+    pairs["b_idx"] = pairs["person_b"].map(node_of)
+
+    people["split"] = split_people(len(people), seed)
+    # A date belongs to the "newest" split of its two people: any date involving
+    # a test person is a test date, so test people never appear in training
+    rank = {"train": 0, "val": 1, "test": 2}
+    names = ["train", "val", "test"]
+    r = np.maximum(people["split"].map(rank).to_numpy()[pairs["a_idx"]],
+                   people["split"].map(rank).to_numpy()[pairs["b_idx"]])
+    pairs["split"] = [names[i] for i in r]
+
+    def tensors(part):
+        sub = pairs[pairs["split"] == part]
+        return (torch.tensor(sub[["a_idx", "b_idx"]].to_numpy().T),
+                torch.tensor(sub["match"].to_numpy(), dtype=torch.float))
+
     x = build_node_features(people)
-    # Person ids are 1-based, node indices are 0-based
-    src = torch.tensor(matches["source"].to_numpy() - 1)
-    dst = torch.tensor(matches["target"].to_numpy() - 1)
-    edge_index = torch.cat([torch.stack([src, dst]), torch.stack([dst, src])], dim=1)
-    return Data(x=x, edge_index=edge_index)
+    train_pairs, train_labels = tensors("train")
+    val_pairs, val_labels = tensors("val")
+    test_pairs, test_labels = tensors("test")
+    return {
+        "people": people,
+        "pairs": pairs,
+        "x": x,
+        # At evaluation the model sees every training match; val/test people have none
+        "edge_index": undirected(train_pairs[:, train_labels == 1]),
+        "train": (train_pairs, train_labels),
+        "val": (val_pairs, val_labels),
+        "test": (test_pairs, test_labels),
+    }
 
 
 class SAGEEncoder(nn.Module):
@@ -103,80 +142,77 @@ class MatchSAGE(nn.Module):
         return self.decoder(self.encoder(x, edge_index), edge_label_index)
 
 
-def train_step(model, optimizer, data):
+def train_step(model, optimizer, ds, use_graph=True):
     model.train()
     optimizer.zero_grad()
-    # Fresh random non-matches every epoch
-    neg_edge_index = negative_sampling(
-        edge_index=data.edge_index,
-        num_nodes=data.num_nodes,
-        num_neg_samples=data.edge_label_index.size(1),
-    )
-    edge_label_index = torch.cat([data.edge_label_index, neg_edge_index], dim=1)
-    edge_label = torch.cat([data.edge_label, torch.zeros(neg_edge_index.size(1))])
+    pairs, labels = ds["train"]
+    num_nodes = ds["x"].size(0)
 
-    cold = torch.rand(data.num_nodes) < COLD_START_RATIO
-    keep = ~(cold[data.edge_index[0]] | cold[data.edge_index[1]])
-    logits = model(data.x, data.edge_index[:, keep], edge_label_index)
-    loss = F.binary_cross_entropy_with_logits(logits, edge_label)
+    # Real dates give real non-matches, so no negative sampling is needed
+    supervised = torch.rand(labels.size(0)) < SUPERVISION_RATIO
+    if use_graph:
+        message = pairs[:, (labels == 1) & ~supervised]
+        cold = torch.rand(num_nodes) < COLD_START_RATIO
+        message = message[:, ~(cold[message[0]] | cold[message[1]])]
+        edge_index = undirected(message)
+    else:
+        edge_index = torch.empty(2, 0, dtype=torch.long)
+
+    logits = model(ds["x"], edge_index, pairs[:, supervised])
+    loss = F.binary_cross_entropy_with_logits(logits, labels[supervised])
     loss.backward()
     optimizer.step()
     return loss.item()
 
 
 @torch.no_grad()
-def evaluate(model, data):
+def predict_probs(model, ds, part, use_graph=True):
     model.eval()
-    probs = torch.sigmoid(model(data.x, data.edge_index, data.edge_label_index)).numpy()
-    labels = data.edge_label.numpy()
+    pairs, labels = ds[part]
+    edge_index = ds["edge_index"] if use_graph else torch.empty(2, 0, dtype=torch.long)
+    return torch.sigmoid(model(ds["x"], edge_index, pairs)).numpy(), labels.numpy()
+
+
+def best_threshold(model, ds, use_graph=True):
+    """Cut-off that maximises F1 on validation. Only ~16% of dates match, so 0.5 is far too high."""
+    probs, labels = predict_probs(model, ds, "val", use_graph)
+    precision, recall, thresholds = precision_recall_curve(labels, probs)
+    f1 = 2 * precision * recall / np.clip(precision + recall, 1e-9, None)
+    return float(thresholds[np.argmax(f1[:-1])])
+
+
+def evaluate(model, ds, part, use_graph=True, threshold=0.5):
+    probs, labels = predict_probs(model, ds, part, use_graph)
+    predicted = probs >= threshold
     return {
         "auc": roc_auc_score(labels, probs),
         "ap": average_precision_score(labels, probs),
-        "acc": accuracy_score(labels, probs > 0.5),
+        "precision": precision_score(labels, predicted, zero_division=0),
+        "recall": recall_score(labels, predicted),
+        "f1": f1_score(labels, predicted),
+        "match_rate": labels.mean(),  # AP of a random guess
     }
 
 
-@torch.no_grad()
-def match_probability(model, data, person_a, person_b):
-    """Probability that two people (1-based ids) match."""
-    model.eval()
-    pair = torch.tensor([[person_a - 1], [person_b - 1]])
-    return torch.sigmoid(model(data.x, data.edge_index, pair)).item()
-
-
-def train(verbose=True):
-    """Train on the generated dataset; returns everything needed to inspect the run."""
-    # PyG's negative_sampling draws from Python's `random`, so seed every RNG
-    random.seed(SEED)
-    np.random.seed(SEED)
-    torch.manual_seed(SEED)
-    people = generate_people()
-    pairs = generate_matches(people)
-    matches = pairs[pairs["match"] == 1]
-    data = build_graph(people, matches)
+def train(use_graph=True, verbose=True, seed=SEED):
+    """Train on the speed dating data; returns everything needed to inspect the run."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    ds = build_dataset(seed)
     if verbose:
-        print(f"graph: {data.num_nodes} people, {matches.shape[0]} matches, {data.num_node_features} features")
+        counts = ds["people"]["split"].value_counts().to_dict()
+        print(f"{ds['x'].size(0)} people ({counts}), {ds['x'].size(1)} features, "
+              f"{len(ds['pairs'])} dates, {int(ds['pairs']['match'].sum())} matches")
 
-    # Val/test hold out real matches plus an equal number of non-matches.
-    # Train negatives are sampled on the fly in train_step.
-    # disjoint_train_ratio keeps supervision edges out of message passing,
-    # otherwise the model learns "edge exists in graph" instead of compatibility.
-    train_data, val_data, test_data = RandomLinkSplit(
-        num_val=0.1,
-        num_test=0.1,
-        is_undirected=True,
-        add_negative_train_samples=False,
-        disjoint_train_ratio=0.3,
-    )(data)
-
-    model = MatchSAGE(data.num_node_features)
+    model = MatchSAGE(ds["x"].size(1))
     optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=5e-4)
 
     best_val_auc, best_state = 0.0, None
     history = []
     for epoch in range(1, EPOCHS + 1):
-        loss = train_step(model, optimizer, train_data)
-        val = evaluate(model, val_data)
+        loss = train_step(model, optimizer, ds, use_graph)
+        val = evaluate(model, ds, "val", use_graph)
         history.append({"epoch": epoch, "loss": loss, "val_auc": val["auc"], "val_ap": val["ap"]})
         if val["auc"] > best_val_auc:
             best_val_auc = val["auc"]
@@ -187,32 +223,41 @@ def train(verbose=True):
     model.load_state_dict(best_state)
     return {
         "model": model,
-        "people": people,
-        "data": data,
-        "train_data": train_data,
-        "val_data": val_data,
-        "test_data": test_data,
+        "ds": ds,
         "history": pd.DataFrame(history),
         "best_val_auc": best_val_auc,
+        "threshold": best_threshold(model, ds, use_graph),
     }
+
+
+def compare_graph(seeds=(1, 2, 3, 4, 5)):
+    """Test AUC with and without message passing, averaged over seeds (the test set is small)."""
+    for use_graph in (True, False):
+        aucs, aps = [], []
+        for seed in seeds:
+            run = train(use_graph=use_graph, verbose=False, seed=seed)
+            test = evaluate(run["model"], run["ds"], "test", use_graph)
+            aucs.append(test["auc"])
+            aps.append(test["ap"])
+        label = "GraphSAGE    " if use_graph else "features only"
+        print(f"{label}  test auc {np.mean(aucs):.4f} +/- {np.std(aucs):.4f}   ap {np.mean(aps):.4f} +/- {np.std(aps):.4f}")
 
 
 def main():
     run = train()
-    model, test_data, best_val_auc = run["model"], run["test_data"], run["best_val_auc"]
-    test = evaluate(model, test_data)
-    print(f"\nbest val auc {best_val_auc:.4f}")
-    print(f"test auc {test['auc']:.4f}  test ap {test['ap']:.4f}  test acc {test['acc']:.4f}")
-
-    torch.save(model.state_dict(), "match_sage.pt")
-
-    # Example: score a few held-out test pairs
-    print("\nsample test predictions:")
-    for k in range(5):
-        a, b = (test_data.edge_label_index[:, k] + 1).tolist()
-        p = match_probability(model, test_data, a, b)
-        print(f"  person {a:3d} & person {b:3d}: p(match) = {p:.3f}  actual = {int(test_data.edge_label[k])}")
+    model, ds, threshold = run["model"], run["ds"], run["threshold"]
+    test = evaluate(model, ds, "test", threshold=threshold)
+    print(f"\nbest val auc {run['best_val_auc']:.4f}, decision threshold {threshold:.3f} (max F1 on val)")
+    print(f"test auc {test['auc']:.4f}  ap {test['ap']:.4f} (random guess: {test['match_rate']:.4f})")
+    print(f"test precision {test['precision']:.4f}  recall {test['recall']:.4f}  f1 {test['f1']:.4f}")
+    torch.save({"state_dict": model.state_dict(), "threshold": threshold}, "match_sage.pt")
+    print("saved match_sage.pt")
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+
+    if "--compare" in sys.argv:
+        compare_graph()
+    else:
+        main()
