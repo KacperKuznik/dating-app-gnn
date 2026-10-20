@@ -1,13 +1,10 @@
-"""Speed Dating data: codebook constants and loaders for the two project CSVs.
+"""Speed Dating data: codebook constants and loaders for the Neo4j graph.
 
-profiles.csv: one row per participant (sign-up survey answers), keyed by `id`.
-matches.csv:  one row per date, `person_a`, `person_b`, `wave`, `match` (1 = both said yes).
-Both are built from the raw Kaggle file by prepare_data.py.
+load_people(): one row per participant (sign-up survey answers), keyed by `id`.
+load_pairs():  one row per date, `person_a`, `person_b`, `match` (1 = both said yes).
+Both read from Neo4j (see graph_db.py), filled from the raw Kaggle file by prepare_data.py.
 """
-import pandas as pd
-
-PROFILES_PATH = "profiles.csv"
-MATCHES_PATH = "matches.csv"
+import graph_db
 
 GENDERS = {0: "female", 1: "male"}
 GOALS = {
@@ -48,10 +45,14 @@ OTHER_NUMERIC = [
     "importance_same_race", "importance_same_religion", "expected_happiness",
 ]
 
+PROFILE_COLUMNS = (["id", "wave", "gender", "age", "field", "goal", "race"] + OTHER_NUMERIC[1:]
+                   + HOBBIES + PREFERENCES + SELF_RATINGS)
 
-def load_people(path=PROFILES_PATH):
-    return pd.read_csv(path)
+
+def load_people():
+    # Neo4j leaves out blank answers, so reindex to bring every column back (as NaN)
+    return graph_db.read_people().reindex(columns=PROFILE_COLUMNS)
 
 
-def load_pairs(path=MATCHES_PATH):
-    return pd.read_csv(path)
+def load_pairs():
+    return graph_db.read_pairs()

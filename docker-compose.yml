@@ -1,0 +1,16 @@
+# Local Neo4j for the project: `docker compose up -d`
+# Browser UI: http://localhost:7474   Bolt (drivers): bolt://localhost:7687
+services:
+  neo4j:
+    image: neo4j:5
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    environment:
+      # Local dev password; graph_db.py uses the same default (override both with NEO4J_PASSWORD)
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-speeddating}
+    volumes:
+      - neo4j_data:/data
+
+volumes:
+  neo4j_data:

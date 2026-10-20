@@ -1,21 +1,16 @@
-"""Build profiles.csv and matches.csv from the raw Kaggle file.
+"""Load the raw Kaggle file into Neo4j as a graph of participants and their dates.
 
-Source: Columbia Speed Dating Experiment (Fisman & Iyengar, 2002-2004)
-https://www.kaggle.com/annavictoria/speed-dating-experiment -> "Speed Dating Data.csv"
-Codes follow "Speed Dating Data Key.doc" that ships with the dataset.
-
-Only answers from the sign-up survey (filled in *before* the event) go into
-profiles.csv. Ratings given during or after a date would leak the outcome.
+Only answers from the sign-up survey (filled in *before* the event) go on the
+Person nodes. Ratings given during or after a date would leak the outcome.
 """
 import pandas as pd
 
-from speed_dating import (
-    FIELDS, GENDERS, GOALS, HOBBIES, MATCHES_PATH, PREFERENCES, PROFILES_PATH, RACES, SELF_RATINGS,
-)
+import graph_db
+from speed_dating import FIELDS, GENDERS, GOALS, HOBBIES, PREFERENCES, RACES, SELF_RATINGS
 
-RAW_PATH = "Speed Dating Data.csv"
+RAW_PATH = "dataset/Speed Dating Data.csv"
 
-# Raw survey column -> readable name used in profiles.csv
+# Raw survey column -> readable property name on Person nodes
 RENAME = {
     "iid": "id",
     "field_cd": "field",
@@ -46,14 +41,13 @@ def build_profiles(raw):
 
 def build_matches(raw):
     # Each date appears twice (once per person): keep one row per pair
-    pairs = raw[raw["iid"] < raw["pid"]][["iid", "pid", "wave", "match"]]
+    pairs = raw[raw["iid"] < raw["pid"]][["iid", "pid", "match"]]
     return pairs.rename(columns={"iid": "person_a", "pid": "person_b"}).astype(int)
 
 
 if __name__ == "__main__":
     raw = pd.read_csv(RAW_PATH, encoding="latin-1").dropna(subset=["pid"])
     profiles, matches = build_profiles(raw), build_matches(raw)
-    profiles.to_csv(PROFILES_PATH, index=False)
-    matches.to_csv(MATCHES_PATH, index=False)
-    print(f"{PROFILES_PATH}: {len(profiles)} people, {profiles.shape[1]} columns")
-    print(f"{MATCHES_PATH}: {len(matches)} dates, {matches['match'].sum()} matches")
+    graph_db.write_graph(profiles, matches)
+    print(f"Neo4j at {graph_db.URI}: {len(profiles)} people, {len(matches)} dates, "
+          f"{matches['match'].sum()} matches")

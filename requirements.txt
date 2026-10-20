@@ -1,0 +1,15 @@
+# Model
+torch
+torch_geometric
+scikit-learn
+numpy
+pandas
+
+# Graph database
+neo4j
+
+# Plots and notebooks
+matplotlib
+networkx
+scipy
+ipykernel
