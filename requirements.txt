@@ -13,3 +13,6 @@ matplotlib
 networkx
 scipy
 ipykernel
+
+# Experiment tracking
+mlflow

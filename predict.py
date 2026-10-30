@@ -2,7 +2,8 @@ import argparse
 
 import torch
 
-from sage_model import MatchSAGE, build_node_features, undirected
+from models import MatchGNN
+from train import build_node_features, undirected
 from speed_dating import load_pairs, load_people
 
 
@@ -16,7 +17,8 @@ def load(model_path="match_sage.pt"):
 
     checkpoint = torch.load(model_path)
     x = build_node_features(people)
-    model = MatchSAGE(x.size(1))
+    # Older checkpoints predate GAT and have no "arch"
+    model = MatchGNN(x.size(1), arch=checkpoint.get("arch", "sage"))
     model.load_state_dict(checkpoint["state_dict"])
     model.eval()
     return {
@@ -55,13 +57,14 @@ def recommend(ctx, person_id, top_k=10):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Predict matches with the trained GraphSAGE model.")
+    parser = argparse.ArgumentParser(description="Predict matches with a trained GraphSAGE / GAT model.")
     parser.add_argument("person", type=int, help="participant id (1-552)")
     parser.add_argument("other", type=int, nargs="?", help="second participant's id; omit to get recommendations")
     parser.add_argument("--top", type=int, default=10, help="number of recommendations")
+    parser.add_argument("--model", default="match_sage.pt", help="checkpoint from train.py (match_gat.pt for GAT)")
     args = parser.parse_args()
 
-    ctx = load()
+    ctx = load(args.model)
     if args.other is not None:
         p = predict_pair(ctx, args.person, args.other)
         verdict = "match" if p >= ctx["threshold"] else "no match"
