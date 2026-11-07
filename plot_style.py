@@ -1,4 +1,4 @@
-"""Shared palette, matplotlib style and graph helpers for visualize.ipynb."""
+"""Shared palette, matplotlib style and graph helpers for eda/EDA.ipynb and eda/report/figures.py."""
 import matplotlib.pyplot as plt
 import networkx as nx
 from matplotlib import font_manager

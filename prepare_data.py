@@ -4,12 +4,15 @@ Only answers from the sign-up survey (filled in *before* the event) go on the
 Person nodes. Ratings given during or after a date would leak the outcome.
 People who skipped (almost) the whole sign-up survey are dropped, together with their dates.
 """
+import os
+
 import pandas as pd
 
 import graph_db
 from speed_dating import FIELDS, GENDERS, GOALS, HOBBIES, PREFERENCES, RACES, SELF_RATINGS
 
-RAW_PATH = "dataset/Speed Dating Data.csv"
+# Absolute, so it also works when imported from elsewhere (e.g. the notebook in eda/)
+RAW_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dataset", "Speed Dating Data.csv")
 
 # Raw survey column -> readable property name on Person nodes
 RENAME = {
