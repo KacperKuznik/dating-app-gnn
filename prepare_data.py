@@ -2,6 +2,7 @@
 
 Only answers from the sign-up survey (filled in *before* the event) go on the
 Person nodes. Ratings given during or after a date would leak the outcome.
+People who skipped (almost) the whole sign-up survey are dropped, together with their dates.
 """
 import pandas as pd
 
@@ -24,13 +25,17 @@ RENAME = {
 }
 RAW_PROFILE_COLUMNS = ["iid", "wave", "gender", "age", "field_cd", "goal", "race", "date", "go_out",
                        "imprace", "imprelig", "exphappy"] + HOBBIES + [c for c in RENAME if c.endswith("_1")]
+# A person must have answered at least this share of the sign-up survey to be kept. The few who
+# skipped (almost) all of it would only reach the model as imputed medians, i.e. no information.
+MIN_ANSWERED = 0.5
 
 
 def build_profiles(raw):
     # The raw file has one row per person per date; survey answers repeat on each row
     people = raw[RAW_PROFILE_COLUMNS].groupby("iid", as_index=False).first().rename(columns=RENAME)
     people[HOBBIES] = people[HOBBIES].clip(0, 10)  # a few answers were outside the 1-10 scale
-    # Waves 6-9 rated preferences 1-10, the rest split 100 points: turn both into shares
+    # 100-point splits whose totals are not always exactly 100 (90-148): turn them into shares.
+    # (The codebook says waves 6-9 used a 1-10 scale, but the Kaggle file already rescales them to 100.)
     people[PREFERENCES] = people[PREFERENCES].div(people[PREFERENCES].sum(axis=1), axis=0)
     people["gender"] = people["gender"].map(GENDERS)
     people["field"] = people["field"].map(FIELDS)
@@ -45,9 +50,20 @@ def build_matches(raw):
     return pairs.rename(columns={"iid": "person_a", "pid": "person_b"}).astype(int)
 
 
+def drop_empty_profiles(people, pairs):
+    """Drop people who answered less than MIN_ANSWERED of the survey, and every date they were on."""
+    answers = people.drop(columns=["id", "wave", "gender"])  # these three are never missing
+    keep = answers.notna().mean(axis=1) >= MIN_ANSWERED
+    kept_ids = people.loc[keep, "id"]
+    pairs = pairs[pairs["person_a"].isin(kept_ids) & pairs["person_b"].isin(kept_ids)]
+    return people[keep].reset_index(drop=True), pairs.reset_index(drop=True), people.loc[~keep, "id"].tolist()
+
+
 if __name__ == "__main__":
     raw = pd.read_csv(RAW_PATH, encoding="latin-1").dropna(subset=["pid"])
     profiles, matches = build_profiles(raw), build_matches(raw)
+    profiles, matches, dropped = drop_empty_profiles(profiles, matches)
     graph_db.write_graph(profiles, matches)
+    print(f"dropped {len(dropped)} people without a sign-up survey: {dropped}")
     print(f"Neo4j at {graph_db.URI}: {len(profiles)} people, {len(matches)} dates, "
           f"{matches['match'].sum()} matches")
